@@ -7,7 +7,9 @@ from datetime import datetime
 import pandas as pd
 from mailer.smtp_sender import send_email
 import job_application
-
+from flask import Flask, jsonify, request
+import urllib.parse
+import traceback
 # Initialize logger
 os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger("mailbot")
@@ -120,6 +122,9 @@ except Exception as e:
     logger.error(f"Error loading existing leads: {e}")
 
 last_extraction_time = 0.0
+is_scraper_running = False
+current_job_role = "Java Developer"
+current_job_url = ""
 
 def perform_live_extraction(page):
     """Extracts emails mapped to their individual post URLs, saves to DB and logs to flat file."""
@@ -169,7 +174,7 @@ def perform_live_extraction(page):
 
 live_email_logs_path = "exports/live_email_logs.txt"
 
-def background_mailer_loop(job_role):
+def background_mailer_loop():
     """Continuously checks for unsent leads and sends emails in the background."""
     print("[Mailer Thread] Started background mailer.")
     attachment_path = "/Users/agilitas/Downloads/Mark_Andrew.pdf"
@@ -189,8 +194,8 @@ def background_mailer_loop(job_role):
                 email = lead["email"]
                 source_url = lead["source_url"]
                 
-                email_subject = f"Interested to work as a {job_role}"
-                email_body = job_application.get_email_body(job_role, "")
+                email_subject = f"Interested to work as a {current_job_role}"
+                email_body = job_application.get_email_body(current_job_role, current_job_url)
                 
                 success = send_email(
                     to_email=email,
@@ -218,21 +223,14 @@ def background_mailer_loop(job_role):
             logger.error(f"Error in background mailer: {e}")
             time.sleep(10)
 
-def main():
+def run_scraper_flow(target_url):
     global last_extraction_time
-    
-    # 1. Initialize SQLite database structure
-    database.init_db()
+    global is_scraper_running
     
     print("\n" + "=" * 50)
     print("                MAILBOT RUNNER")
     print("=" * 50)
     print(f"Loaded {len(unique_emails)} unique emails from database.")
-    
-    # Start background mailer thread
-    job_role = "Java Developer"
-    mailer_thread = threading.Thread(target=background_mailer_loop, args=(job_role,), daemon=True)
-    mailer_thread.start()
     
     # 2. Launch browser and handle manual login
     try:
@@ -247,7 +245,6 @@ def main():
         print("[Login] Successfully authenticated with LinkedIn.")
         
         # 3. Navigate to search target URL
-        target_url = config.LINKEDIN_DEFAULT_SEARCH_URL
         print(f"[Navigation] Opening target URL:\n {target_url}")
         page.goto(target_url, timeout=60000)
         print("[Navigation] Page loaded. Starting extraction and scrolling...")
@@ -309,6 +306,51 @@ def main():
         # Safely close the browser resources
         print("Closing browser context...")
         linkedin.close_browser()
+        is_scraper_running = False
+
+app = Flask(__name__)
+
+@app.route('/trigger', methods=['GET', 'POST'])
+def trigger_bot():
+    global is_scraper_running
+    global current_job_role
+    global current_job_url
+    
+    if is_scraper_running:
+        return jsonify({"status": "error", "message": "Scraper is already running"}), 409
+        
+    data = request.json or {}
+    keywords = data.get("keywords", [])
+    if keywords:
+        encoded_keywords = urllib.parse.quote(" ".join(f'"{kw}"' for kw in keywords))
+        target_url = f'https://www.linkedin.com/search/results/content/?keywords={encoded_keywords}&origin=FACETED_SEARCH&datePosted=%5B%22past-week%22%5D'
+    else:
+        target_url = config.LINKEDIN_DEFAULT_SEARCH_URL
+        
+    current_job_role = data.get("job_role", current_job_role)
+    current_job_url = data.get("job_url", current_job_url)
+    
+    is_scraper_running = True
+    threading.Thread(target=run_scraper_flow, args=(target_url,), daemon=True).start()
+    return jsonify({
+        "status": "success", 
+        "message": "Scraper started in background",
+        "target_url": target_url,
+        "job_role": current_job_role,
+        "job_url": current_job_url
+    }), 200
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    return jsonify({"status": "running" if is_scraper_running else "idle"})
 
 if __name__ == "__main__":
-    main()
+    # 1. Initialize SQLite database structure
+    database.init_db()
+    
+    # 2. Start background mailer thread
+    mailer_thread = threading.Thread(target=background_mailer_loop, daemon=True)
+    mailer_thread.start()
+    
+    print("Starting Mailbot Web Server on port 5001...")
+    app.run(host="0.0.0.0", port=5001, debug=False)
